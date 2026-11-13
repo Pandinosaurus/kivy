@@ -12,9 +12,20 @@ function raise-only-error{
     }
 }
 
+function Handle-NonZero-ExitCode {
+    param (
+        [int]$ExitCode
+    )
+
+    Write-Host "Exit code is: $ExitCode"
+    if ($ExitCode -ne 0) {
+        throw "Exiting due to non-zero exit code"
+    }
+}
+
 function Update-version-metadata {
     $current_time = python -c "from time import time; from os import environ; print(int(environ.get('SOURCE_DATE_EPOCH', time())))"
-    $date = python -c "from datetime import datetime; print(datetime.utcfromtimestamp($current_time).strftime('%Y%m%d'))"
+    $date = python -c "from datetime import datetime, timezone; print(datetime.fromtimestamp($current_time, timezone.utc).strftime('%Y%m%d'))"
     echo "Version date is: $date"
     $git_tag = git rev-parse HEAD
     echo "Git tag is: $git_tag"
@@ -24,10 +35,9 @@ function Update-version-metadata {
 }
 
 function Generate-sdist {
-    python -m pip install cython
-    python setup.py sdist --formats=gztar
-    python setup.py bdist_wheel --build_examples --universal
-    python -m pip uninstall cython -y
+    python -m pip install -U build
+    python -m build --sdist .
+    python -m build --wheel --outdir dist packaging/kivy_examples
 }
 
 function Generate-windows-wheels {
@@ -36,9 +46,9 @@ function Generate-windows-wheels {
 
 function Rename-windows-wheels {
     # Set new wheel name, keep default if release (tag)
-    # release: Kivy-X.Y.Z-cpAB-cpABm-ARCH.whl (Kivy_examples-X.Y.Z-py2.py3-none-any.whl)
-    # nightly: Kivy-X.Y.Z.dev0-cpAB-cpABm-ARCH.whl (Kivy_examples-X.Y.Z.dev0-py2.py3-none-any.whl)
-    # archive: Kivy-X.Y.Z.dev0.YYYYMMDD.githash-cpAB-cpABm-ARCH.whl (Kivy_examples-X.Y.Z.dev0.YYYYMMDD.githash-py2.py3-none-any.whl)
+    # release: kivy-X.Y.Z-cpAB-cpABm-ARCH.whl (kivy_examples-X.Y.Z-py2.py3-none-any.whl)
+    # nightly: kivy-X.Y.Z.dev0-cpAB-cpABm-ARCH.whl (kivy_examples-X.Y.Z.dev0-py2.py3-none-any.whl)
+    # archive: kivy-X.Y.Z.dev0.YYYYMMDD.githash-cpAB-cpABm-ARCH.whl (kivy_examples-X.Y.Z.dev0.YYYYMMDD.githash-py2.py3-none-any.whl)
 
     $WHEEL_DATE = python -c "from datetime import datetime;print(datetime.utcnow().strftime('%Y%m%d'))"
     echo "Wheel date is: $WHEEL_DATE"
@@ -61,19 +71,9 @@ function Rename-windows-wheels {
 }
 
 function Upload-windows-wheels-to-server($ip) {
-    echo "Uploading Kivy*:"
+    echo "Uploading kivy*.whl:"
     dir dist
-    C:\tools\msys64\usr\bin\bash --login -c ".ci/windows-server-upload.sh $ip dist 'Kivy*' ci/win/kivy/"
-}
-
-function Install-kivy-test-run-win-deps {
-
-}
-
-function Install-kivy-test-run-pip-deps {
-    python -m pip install pip wheel setuptools --upgrade
-    # workaround for https://github.com/pyinstaller/pyinstaller/issues/4265 until next release
-    python -m pip install https://github.com/pyinstaller/pyinstaller/archive/develop.zip twine
+    C:\tools\msys64\usr\bin\bash --login -c ".ci/windows-server-upload.sh $ip dist 'kivy*.whl' ci/win/kivy/"
 }
 
 function Install-kivy {
@@ -86,14 +86,10 @@ function Install-kivy-wheel {
     ls $root/dist
     cd "$HOME"
 
-    python -m pip install pip wheel setuptools --upgrade
-    # workaround for https://github.com/pyinstaller/pyinstaller/issues/4265 until next release
-    python -m pip install https://github.com/pyinstaller/pyinstaller/archive/develop.zip
-
     $version=python -c "import sys; print('{}{}'.format(sys.version_info.major, sys.version_info.minor))"
     $bitness=python -c "import sys; print('win_amd64' if sys.maxsize > 2**32 else 'win32')"
-    $kivy_fname=(ls $root/dist/Kivy-*$version*$bitness*.whl | Sort-Object -property @{Expression={$_.name.tostring().Length}} | Select-Object -First 1).name
-    $kivy_examples_fname=(ls $root/dist/Kivy_examples-*.whl | Sort-Object -property @{Expression={$_.name.tostring().Length}} | Select-Object -First 1).name
+    $kivy_fname=(ls $root/dist/kivy-*$version*$bitness*.whl | Sort-Object -property @{Expression={$_.name.tostring().Length}} | Select-Object -First 1).name
+    $kivy_examples_fname=(ls $root/dist/kivy_examples-*.whl | Sort-Object -property @{Expression={$_.name.tostring().Length}} | Select-Object -First 1).name
     echo "kivy_fname = $kivy_fname, kivy_examples_fname = $kivy_examples_fname"
     python -m pip install "$root/dist/$kivy_fname[full,dev]" "$root/dist/$kivy_examples_fname"
 }
@@ -102,20 +98,31 @@ function Install-kivy-sdist {
     $root=(pwd).Path
     cd "$HOME"
 
-    python -m pip install pip wheel setuptools --upgrade
-    # workaround for https://github.com/pyinstaller/pyinstaller/issues/4265 until next release
-    python -m pip install https://github.com/pyinstaller/pyinstaller/archive/develop.zip
-
-    $kivy_fname=(ls $root/dist/Kivy-*.tar.gz).name
+    $kivy_fname=(ls $root/dist/kivy-*.tar.gz).name
     python -m pip install "$root/dist/$kivy_fname[full,dev]"
 }
 
 function Test-kivy {
-    python -m pytest --timeout=300 --cov=kivy --cov-report term --cov-branch "$(pwd)/kivy/tests"
+    # Tests with default environment variables.
+    python -m pytest --timeout=400 --cov=kivy --cov-branch --cov-report= "$(pwd)/kivy/tests"
+
+    # Check the exit code.
+    # For some reason, if we get a Windows Fatal Error during the tests, pytest
+    # stops the tests, but does not fail.
+    # Since we do not have an option like -e for bash, we need to check the exit
+    # code manually, so the CI job fails if something goes wrong.
+    # See issue https://github.com/kivy/kivy/issues/8484 for more details.
+    Handle-NonZero-ExitCode -ExitCode $LastExitCode
+
+    # Logging tests, with non-default log modes
+    $env:KIVY_LOG_MODE = 'PYTHON'
+    python -m pytest -m logmodepython --timeout=400 --cov=kivy --cov-append --cov-report= --cov-branch "$(pwd)/kivy/tests"
+    $env:KIVY_LOG_MODE = 'MIXED'
+    python -m pytest -m logmodemixed --timeout=400 --cov=kivy --cov-append --cov-report=term --cov-branch "$(pwd)/kivy/tests"
 }
 
 function Test-kivy-benchmark {
-    python -m pytest "$(pwd)/kivy/tests" --benchmark-only
+    pytest --pyargs kivy.tests --benchmark-only
 }
 
 function Test-kivy-installed {
@@ -125,10 +132,5 @@ function Test-kivy-installed {
     cd "$test_path"
 
     echo "[run]`nplugins = kivy.tools.coverage`n" > .coveragerc
-    raise-only-error -Func {python -m pytest --timeout=300 .}
-}
-
-function Upload-artifacts-to-pypi {
-  python -m pip install twine
-  twine upload dist/*
+    raise-only-error -Func {python -m pytest --timeout=400 .}
 }

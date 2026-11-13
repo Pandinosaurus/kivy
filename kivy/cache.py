@@ -193,7 +193,7 @@ class Cache(object):
         import heapq
         time = Clock.get_time()
         heap_list = []
-        for key in Cache._objects[category]:
+        for key in list(Cache._objects[category]):
             obj = Cache._objects[category][key]
             if obj['lastaccess'] == obj['timestamp'] == time:
                 continue
@@ -232,9 +232,10 @@ class Cache(object):
                 lastaccess = Cache._objects[category][key]['lastaccess']
                 objtimeout = Cache._objects[category][key]['timeout']
 
-                # take the object timeout if available
-                if objtimeout is not None:
-                    timeout = objtimeout
+                # take the object timeout if available, else the category's
+                timeout = (
+                    objtimeout if objtimeout is not None
+                    else Cache._categories[category]['timeout'])
 
                 # no timeout, cancel
                 if timeout is None:

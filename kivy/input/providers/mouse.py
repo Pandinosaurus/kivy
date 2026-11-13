@@ -21,8 +21,16 @@ Using multitouch interaction with the mouse
 
 By default, the middle and right mouse buttons, as well as a combination of
 ctrl + left mouse button are used for multitouch emulation.
-If you want to use them for other purposes, you can disable this behavior by
-activating the "disable_multitouch" token::
+
+When multitouch simulation is enabled, pressing the right or middle button (or
+ctrl + left button) places a red dot on screen representing a held touch. The
+dot follows the cursor while the button is held, then stays fixed at its last
+position until it is picked up again (by clicking near it) or removed (by
+clicking on it with the left button). Pressing ctrl + left click behaves
+identically to a right-click for multitouch emulation purposes.
+
+If you want to use these mouse buttons for other purposes, you can disable
+this behavior by activating the "disable_multitouch" token::
 
    [input]
    mouse = mouse,disable_multitouch
@@ -46,6 +54,30 @@ touch will simulate a multi-touch event. For example::
     if 'multitouch_sim' in touch.profile:
         touch.multitouch_sim = True
 
+.. versionchanged:: 2.1.0
+
+Provider dispatches hover events by listening to properties/events in
+:class:`~kivy.core.window.Window`. Dispatching can be disabled by setting
+:attr:`MouseMotionEventProvider.disable_hover` to ``True`` or by adding
+`disable_hover` in the config::
+
+    [input]
+    mouse = mouse,disable_hover
+
+It's also possible to enable/disable hover events at runtime with
+:attr:`MouseMotionEventProvider.disable_hover` property.
+
+.. versionchanged:: 3.0.0
+
+Multiple mouse buttons can now be held down and tracked simultaneously
+when multitouch simulation is disabled (`disable_multitouch`). Previously,
+only one button could be tracked at a time: pressing a second button while
+the first was still held would be ignored until the first was released.
+
+When multitouch simulation is enabled, only one simulated touch (the red
+dot) is active at a time, as before; this change only affects the case
+where `disable_multitouch` is set.
+
 Following is a list of the supported values for the
 :attr:`~kivy.input.motionevent.MotionEvent.profile` property list.
 
@@ -61,6 +93,9 @@ pos              2D position. Also reflected in the
                  properties.
 multitouch_sim   Specifies whether multitouch is simulated or not. Accessed
                  via the 'multitouch_sim' property.
+
+modifiers        Active keyboard modifiers (list of strings: 'ctrl', 'alt',
+                 'shift', etc.). Accessed via the 'modifiers' property.
 ================ ==========================================================
 
 '''
@@ -82,6 +117,7 @@ class MouseMotionEvent(MotionEvent):
 
     def __init__(self, *args, **kwargs):
         self.multitouch_sim = False
+        self.modifiers = []
         super().__init__(*args, **kwargs)
 
     def depack(self, args):
@@ -90,10 +126,10 @@ class MouseMotionEvent(MotionEvent):
         if self.is_touch:
             # don't overwrite previous profile
             if not profile:
-                profile.extend(('pos', 'button'))
+                profile.extend(('pos', 'button', 'modifiers'))
             if len(args) >= 3:
                 self.button = args[2]
-            if len(args) == 4:
+            if len(args) >= 4:
                 self.multitouch_sim = args[3]
                 profile.append('multitouch_sim')
         else:
@@ -121,7 +157,7 @@ class MouseMotionEvent(MotionEvent):
 
             # use same logic as WindowBase.on_motion() so we get correct
             # coordinates when _density != 1
-            w, h = win._get_effective_size()
+            w, h = win.unrotated_size
 
             self.scale_for_screen(w, h, rotation=win.rotation)
 
@@ -136,19 +172,18 @@ class MouseMotionEvent(MotionEvent):
 
 
 class MouseMotionEventProvider(MotionEventProvider):
-    __handlers__ = {}
-
     def __init__(self, device, args):
         super(MouseMotionEventProvider, self).__init__(device, args)
         self.waiting_event = deque()
         self.touches = {}
         self.counter = 0
-        self.current_drag = None
-        self.alt_touch = None
+        self.current_drag = {}
         self.disable_on_activity = False
         self.disable_multitouch = False
         self.multitouch_on_demand = False
         self.hover_event = None
+        self._disable_hover = False
+        self._running = False
         # split arguments
         args = args.split(',')
         for arg in args:
@@ -159,10 +194,34 @@ class MouseMotionEventProvider(MotionEventProvider):
                 self.disable_on_activity = True
             elif arg == 'disable_multitouch':
                 self.disable_multitouch = True
+            elif arg == 'disable_hover':
+                self.disable_hover = True
             elif arg == 'multitouch_on_demand':
                 self.multitouch_on_demand = True
             else:
                 Logger.error('Mouse: unknown parameter <%s>' % arg)
+
+    def _get_disable_hover(self):
+        return self._disable_hover
+
+    def _set_disable_hover(self, value):
+        if self._disable_hover != value:
+            if self._running:
+                if value:
+                    self._stop_hover_events()
+                else:
+                    self._start_hover_events()
+            self._disable_hover = value
+
+    disable_hover = property(_get_disable_hover, _set_disable_hover)
+    '''Disables dispatching of hover events if set to ``True``.
+
+    Hover events are enabled by default (`disable_hover` is ``False``). See
+    module documentation if you want to enable/disable hover events through
+    config file.
+
+    .. versionadded:: 2.1.0
+    '''
 
     def start(self):
         '''Start the mouse provider'''
@@ -172,6 +231,14 @@ class MouseMotionEventProvider(MotionEventProvider):
         fbind('on_mouse_down', self.on_mouse_press)
         fbind('on_mouse_move', self.on_mouse_motion)
         fbind('on_mouse_up', self.on_mouse_release)
+        fbind('on_rotate', self.update_touch_graphics)
+        fbind('system_size', self.update_touch_graphics)
+        if not self.disable_hover:
+            self._start_hover_events()
+        self._running = True
+
+    def _start_hover_events(self):
+        fbind = EventLoop.window.fbind
         fbind('mouse_pos', self.begin_or_update_hover_event)
         fbind('system_size', self.update_hover_event)
         fbind('on_cursor_enter', self.begin_hover_event)
@@ -187,6 +254,14 @@ class MouseMotionEventProvider(MotionEventProvider):
         funbind('on_mouse_down', self.on_mouse_press)
         funbind('on_mouse_move', self.on_mouse_motion)
         funbind('on_mouse_up', self.on_mouse_release)
+        funbind('on_rotate', self.update_touch_graphics)
+        funbind('system_size', self.update_touch_graphics)
+        if not self.disable_hover:
+            self._stop_hover_events()
+        self._running = False
+
+    def _stop_hover_events(self):
+        funbind = EventLoop.window.funbind
         funbind('mouse_pos', self.begin_or_update_hover_event)
         funbind('system_size', self.update_hover_event)
         funbind('on_cursor_enter', self.begin_hover_event)
@@ -199,8 +274,7 @@ class MouseMotionEventProvider(MotionEventProvider):
             return False
         # trying to get if we currently have other touch than us
         # discard touches generated from kinetic
-        touches = EventLoop.touches
-        for touch in touches:
+        for touch in EventLoop.touches:
             # discard all kinetic touch
             if touch.__class__.__name__ == 'KineticMotionEvent':
                 continue
@@ -209,55 +283,61 @@ class MouseMotionEventProvider(MotionEventProvider):
                 return True
         return False
 
-    def find_touch(self, x, y):
-        factor = 10. / EventLoop.window.system_size[0]
-        for t in self.touches.values():
-            if abs(x - t.sx) < factor and abs(y - t.sy) < factor:
-                return t
-        return False
+    def find_touch(self, win, x, y):
+        factor = 10. / win.system_size[0]
+        for touch in self.touches.values():
+            if abs(x - touch.sx) < factor and abs(y - touch.sy) < factor:
+                return touch
+        return None
 
     def create_event_id(self):
         self.counter += 1
         return self.device + str(self.counter)
 
-    def create_touch(self, rx, ry, is_double_tap, do_graphics, button):
+    def create_touch(self, win, nx, ny, do_graphics, button, modifiers=None):
         event_id = self.create_event_id()
-        args = [rx, ry, button]
+        args = [nx, ny, button]
         if do_graphics:
             args += [not self.multitouch_on_demand]
-        self.current_drag = cur = MouseMotionEvent(
+        # When multitouch simulation is enabled, only one simulated drag
+        # (the red dot) can be active at a time, so all such touches share
+        # a single key. When multitouch is disabled, each button tracks its
+        # own independent drag, so multiple mouse buttons can be held down
+        # simultaneously (see #3597).
+        key = button if self.disable_multitouch else 'mt_simulation'
+        self.current_drag[key] = touch = MouseMotionEvent(
             self.device, event_id, args,
-            is_touch=True
+            is_touch=True,
+            type_id='touch'
         )
-        cur.is_double_tap = is_double_tap
-        self.touches[event_id] = cur
+        touch.modifiers = [] if modifiers is None else modifiers
+        self.touches[event_id] = touch
         if do_graphics:
             # only draw red circle if multitouch is not disabled, and
             # if the multitouch_on_demand feature is not enable
             # (because in that case, we wait to see if multitouch_sim
             # is True or not before doing the multitouch)
             create_flag = (
-                (not self.disable_multitouch) and
-                (not self.multitouch_on_demand)
+                not self.disable_multitouch
+                and not self.multitouch_on_demand
             )
-            cur.update_graphics(EventLoop.window, create_flag)
-        self.waiting_event.append(('begin', cur))
-        return cur
+            touch.update_graphics(win, create_flag)
+        self.waiting_event.append(('begin', touch))
+        return touch
 
-    def remove_touch(self, cur):
-        if cur.id not in self.touches:
-            return
-        del self.touches[cur.id]
-        cur.update_time_end()
-        self.waiting_event.append(('end', cur))
-        cur.clear_graphics(EventLoop.window)
+    def remove_touch(self, win, touch):
+        if touch.id in self.touches:
+            del self.touches[touch.id]
+            touch.update_time_end()
+            self.waiting_event.append(('end', touch))
+            touch.clear_graphics(win)
 
-    def create_hover(self, etype, win):
-        x_max, y_max = win.system_size[0] - 1, win.system_size[1] - 1
-        args = (
-            win.mouse_pos[0] / win._density / x_max if x_max > 0 else 0.0,
-            win.mouse_pos[1] / win._density / y_max if y_max > 0 else 0.0
-        )
+    def create_hover(self, win, etype):
+        nx, ny = win.to_normalized_pos(*win.mouse_pos)
+        # Divide by density because it's used by mouse_pos
+        nx /= win._density
+        ny /= win._density
+        args = (nx, ny)
         hover = self.hover_event
         if hover:
             hover.move(args)
@@ -265,7 +345,8 @@ class MouseMotionEventProvider(MotionEventProvider):
             self.hover_event = hover = MouseMotionEvent(
                 self.device,
                 self.create_event_id(),
-                args
+                args,
+                type_id='hover'
             )
         if etype == 'end':
             hover.update_time_end()
@@ -273,86 +354,84 @@ class MouseMotionEventProvider(MotionEventProvider):
         self.waiting_event.append((etype, hover))
 
     def on_mouse_motion(self, win, x, y, modifiers):
-        x_max, y_max = win.system_size[0] - 1.0, win.system_size[1] - 1.0
-        rx = x / x_max if x_max > 0 else 0.0
-        ry = 1.0 - (y / y_max if y_max > 0 else 0.0)
-        if self.current_drag:
-            cur = self.current_drag
-            cur.move([rx, ry])
-            cur.update_graphics(win)
-            self.waiting_event.append(('update', cur))
-        elif self.alt_touch is not None and 'alt' not in modifiers:
-            # alt just released ?
-            is_double_tap = 'shift' in modifiers
-            cur = self.create_touch(rx, ry, is_double_tap, True, [])
-        return True
+        nx, ny = win.to_normalized_pos(x, y)
+        ny = 1.0 - ny
+        for touch in self.current_drag.values():
+            touch.move([nx, ny])
+            touch.update_graphics(win)
+            touch.modifiers = modifiers
+            self.waiting_event.append(('update', touch))
 
     def on_mouse_press(self, win, x, y, button, modifiers):
         if self.test_activity():
             return
-        x_max, y_max = win.system_size[0] - 1.0, win.system_size[1] - 1.0
-        rx = x / x_max if x_max > 0 else 0.0
-        ry = 1.0 - (y / y_max if y_max > 0 else 0.0)
-        new_me = self.find_touch(rx, ry)
-        if new_me:
-            self.current_drag = new_me
+        nx, ny = win.to_normalized_pos(x, y)
+        ny = 1.0 - ny
+        # picking up an existing "sticky" multitouch-sim dot by clicking
+        # near it is only meaningful when multitouch simulation is enabled
+        found_touch = (
+            None if self.disable_multitouch
+            else self.find_touch(win, nx, ny)
+        )
+        if found_touch:
+            self.current_drag['mt_simulation'] = found_touch
         else:
-            is_double_tap = 'shift' in modifiers
-            do_graphics = (not self.disable_multitouch) and (
-                button != 'left' or 'ctrl' in modifiers)
-            cur = self.create_touch(rx, ry, is_double_tap, do_graphics, button)
-            if 'alt' in modifiers:
-                self.alt_touch = cur
-                self.current_drag = None
-        return True
+            do_graphics = (
+                not self.disable_multitouch
+                and (button != 'left' or 'ctrl' in modifiers)
+            )
+            self.create_touch(
+                win, nx, ny, do_graphics, button, modifiers
+            )
 
     def on_mouse_release(self, win, x, y, button, modifiers):
-        # special case, if button is all, then remove all the current mouses.
         if button == 'all':
-            for cur in list(self.touches.values())[:]:
-                self.remove_touch(cur)
-            self.current_drag = None
-
-        cur = self.current_drag
-        if cur:
+            # Special case, if button is all,
+            # then remove all the current touches.
+            for touch in list(self.touches.values()):
+                self.remove_touch(win, touch)
+            self.current_drag.clear()
+            return
+        key = button if self.disable_multitouch else 'mt_simulation'
+        touch = self.current_drag.get(key)
+        if touch:
+            touch.modifiers = modifiers
             not_right = button in (
                 'left',
                 'scrollup', 'scrolldown',
                 'scrollleft', 'scrollright'
             )
-            not_ctrl = not ('ctrl' in modifiers)
+            not_ctrl = 'ctrl' not in modifiers
             not_multi = (
-                self.disable_multitouch or
-                'multitouch_sim' not in cur.profile or
-                not cur.multitouch_sim
+                self.disable_multitouch
+                or 'multitouch_sim' not in touch.profile
+                or not touch.multitouch_sim
             )
-
-            if (not_right and not_ctrl or not_multi):
-                self.remove_touch(cur)
-                self.current_drag = None
+            if (not_right and not_ctrl) or not_multi:
+                self.remove_touch(win, touch)
+                del self.current_drag[key]
             else:
-                cur.update_graphics(EventLoop.window, True)
+                touch.update_graphics(win, True)
 
-        if self.alt_touch:
-            self.remove_touch(self.alt_touch)
-            self.alt_touch = None
-        return True
+    def update_touch_graphics(self, win, *args):
+        for touch in self.touches.values():
+            touch.update_graphics(win)
 
     def begin_or_update_hover_event(self, win, *args):
         etype = 'update' if self.hover_event else 'begin'
-        self.create_hover(etype, win)
+        self.create_hover(win, etype)
 
     def begin_hover_event(self, win, *args):
         if not self.hover_event:
-            self.create_hover('begin', win)
+            self.create_hover(win, 'begin')
 
     def update_hover_event(self, win, *args):
         if self.hover_event:
-            self.create_hover('update', win)
+            self.create_hover(win, 'update')
 
     def end_hover_event(self, win, *args):
         if self.hover_event:
-            self.create_hover('end', win)
+            self.create_hover(win, 'end')
 
     def update(self, dispatch_fn):
         '''Update the mouse provider (pop event from the queue)'''

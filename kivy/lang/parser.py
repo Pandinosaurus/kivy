@@ -10,6 +10,7 @@ import re
 import sys
 import traceback
 import ast
+import importlib
 from re import sub, findall
 from types import CodeType
 from functools import partial
@@ -17,7 +18,6 @@ from collections import OrderedDict, defaultdict
 
 import kivy.lang.builder  # imported as absolute to avoid circular import
 from kivy.logger import Logger
-from kivy.cache import Cache
 from kivy import require
 from kivy.resources import resource_find
 from kivy.utils import rgba
@@ -28,9 +28,6 @@ __all__ = ('Parser', 'ParserException')
 
 trace = Logger.trace
 global_idmap = {}
-
-# register cache for creating new classtype (template)
-Cache.register('kv.lang')
 
 # all previously included files
 __KV_INCLUDES__ = []
@@ -199,7 +196,6 @@ class ParserRuleProperty(object):
         # now, detect obj.prop
         # find all the fstrings in the  value
         fstrings = lang_fstr.findall(value)
-        expressions = [ast.parse(s) for s in fstrings]
         wk = set()
         for s in fstrings:
             expression = ast.parse(s)
@@ -230,11 +226,10 @@ class ParserRuleProperty(object):
 
         if isinstance(node, (ast.JoinedStr, ast.BoolOp)):
             for n in node.values:
-                if isinstance(n, ast.Str):
-                    # NOTE: required for python3.6
-                    yield from cls.get_names_from_expression(n.s)
-                else:
-                    yield from cls.get_names_from_expression(n.value)
+                yield from cls.get_names_from_expression(n)
+
+        if isinstance(node, ast.FormattedValue):
+            yield from cls.get_names_from_expression(node.value)
 
         if isinstance(node, ast.BinOp):
             yield from cls.get_names_from_expression(node.right)
@@ -276,8 +271,17 @@ class ParserRuleProperty(object):
             yield from cls.get_names_from_expression(node.iter.value)
 
         if isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name):
-                yield f'{node.value.id}.{node.attr}'
+            # Build full dotted attribute path (e.g. "root.object.property")
+            attribute_parts = []
+            current_node = node
+            while isinstance(current_node, ast.Attribute):
+                attribute_parts.append(current_node.attr)
+                current_node = current_node.value
+            if isinstance(current_node, ast.Name):
+                attribute_parts.append(current_node.id)
+                full_attribute = ".".join(reversed(attribute_parts))
+                yield full_attribute
+            return
 
         if isinstance(node, ast.Call):
             yield from cls.get_names_from_expression(node.func)
@@ -376,7 +380,11 @@ class ParserRule(object):
         if c == '<':
             self._build_rule()
         elif c == '[':
-            self._build_template()
+            raise ParserException(
+                self.ctx, self.line,
+                'Kivy lang templates ([Name@Base]:) were deprecated in 1.7.0 '
+                'and have been removed. Use a dynamic class '
+                '<Name@Base>: instead.')
         else:
             if self.ctx.root is not None:
                 raise ParserException(
@@ -401,7 +409,7 @@ class ParserRule(object):
         for rule in re.split(lang_cls_split_pat, name):
             crule = None
 
-            if not len(rule):
+            if not rule:
                 raise ParserException(self.ctx, self.line,
                                       'Empty rule detected')
 
@@ -427,29 +435,6 @@ class ParserRule(object):
 
             self.ctx.rules.append((crule, self))
 
-    def _build_template(self):
-        name = self.name
-        exception = ParserException(
-            self.ctx, self.line,
-            'Deprecated Kivy lang template syntax used "{}". Templates will '
-            'be removed in a future version'.format(name))
-        if name not in ('[FileListEntry@FloatLayout+TreeViewNode]',
-                        '[FileIconEntry@Widget]',
-                        '[AccordionItemTitle@Label]'):
-            Logger.warning(exception)
-
-        if __debug__:
-            trace('Builder: build template for %s' % name)
-        if name[0] != '[' or name[-1] != ']':
-            raise ParserException(self.ctx, self.line,
-                                  'Invalid template (must be inside [])')
-        item_content = name[1:-1]
-        if '@' not in item_content:
-            raise ParserException(self.ctx, self.line,
-                                  'Invalid template name (missing @)')
-        template_name, template_root_cls = item_content.split('@')
-        self.ctx.templates.append((template_name, template_root_cls, self))
-
     def __repr__(self):
         return '<ParserRule name=%r>' % (self.name, )
 
@@ -465,13 +450,12 @@ class Parser(object):
         list(range(ord('a'), ord('z') + 1)) +
         list(range(ord('0'), ord('9') + 1)) + [ord('_')])
 
-    __slots__ = ('rules', 'templates', 'root', 'sourcecode',
+    __slots__ = ('rules', 'root', 'sourcecode',
                  'directives', 'filename', 'dynamic_classes')
 
     def __init__(self, **kwargs):
         super(Parser, self).__init__()
         self.rules = []
-        self.templates = []
         self.root = None
         self.sourcecode = []
         self.directives = []
@@ -496,12 +480,12 @@ class Parser(object):
             elif cmd[:4] == 'set ':
                 try:
                     name, value = cmd[4:].strip().split(' ', 1)
-                except:
+                except Exception:
                     Logger.exception('')
                     raise ParserException(self, ln, 'Invalid directive syntax')
                 try:
                     value = eval(value, global_idmap)
-                except:
+                except Exception:
                     Logger.exception('')
                     raise ParserException(self, ln, 'Invalid value')
                 global_idmap[name] = value
@@ -519,7 +503,7 @@ class Parser(object):
                     ref = ref[c:-c] if c != 2 else ref
 
                 if ref[-3:] != '.kv':
-                    Logger.warn('Lang: {0} does not have a valid Kivy'
+                    Logger.warning('Lang: {0} does not have a valid Kivy'
                                 'Language extension (.kv)'.format(ref))
                     break
                 if ref in __KV_INCLUDES__:
@@ -528,7 +512,7 @@ class Parser(object):
                                               'Invalid or unknown file: {0}'
                                               .format(ref))
                     if not force_load:
-                        Logger.warn('Lang: {0} has already been included!'
+                        Logger.warning('Lang: {0} has already been included!'
                                     .format(ref))
                         continue
                     else:
@@ -550,9 +534,10 @@ class Parser(object):
                 try:
                     if package not in sys.modules:
                         try:
-                            mod = __import__(package)
+                            mod = importlib.__import__(package)
                         except ImportError:
-                            mod = __import__('.'.join(package.split('.')[:-1]))
+                            module_name = '.'.join(package.split('.')[:-1])
+                            mod = importlib.__import__(module_name)
                         # resolve the whole thing
                         for part in package.split('.')[1:]:
                             mod = getattr(mod, part)
@@ -658,7 +643,7 @@ class Parser(object):
             # Current level, create an object
             elif count == indent:
                 x = content.split(':', 1)
-                if not len(x[0]):
+                if not x[0]:
                     raise ParserException(self, ln, 'Identifier missing')
                 if (len(x) == 2 and len(x[1]) and
                         not x[1].lstrip().startswith('#')):
@@ -678,7 +663,7 @@ class Parser(object):
             # Next level, is it a property or an object ?
             elif count == indent + spaces:
                 x = content.split(':', 1)
-                if not len(x[0]):
+                if not x[0]:
                     raise ParserException(self, ln, 'Identifier missing')
 
                 # It's a class, add to the current object as a children
@@ -694,6 +679,8 @@ class Parser(object):
                             self, ln, 'clear previous, `-`, not allowed here')
                     _objects, _lines = self.parse_level(
                         level + 1, lines[i:], spaces)
+                    if current_object is None:
+                        raise ParserException(self, ln, 'Invalid indentation')
                     current_object.children = _objects
                     lines = _lines
                     i = 0
@@ -752,6 +739,9 @@ class Parser(object):
                     if current_propobject is None:
                         current_propobject = ParserRuleProperty(
                             self, ln, current_property, content)
+                        if not current_property:
+                            raise ParserException(self, ln,
+                                                  "Invalid indentation")
                         if current_property[:3] == 'on_':
                             current_object.handlers.append(current_propobject)
                         else:
